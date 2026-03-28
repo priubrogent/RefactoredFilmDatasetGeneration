@@ -91,21 +91,32 @@ def compute_defect_mask(
     diff_scan_vs_r1: np.ndarray,
     diff_scan_vs_r2: np.ndarray,
     threshold: float = 0.10,
+    morph_kernel: int = 3,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute defect mask from two gradient-difference maps.
 
-    Two outputs:
-      mask_raw  — raw product map (diff1 * diff2), float32, used for
-                  visualisation / soft weighting.
-      mask      — binary uint8 mask (255 = defect) thresholded from mask_raw.
+    mask_raw — product map (diff1 * diff2), float32, kept for visualisation.
 
-    Matches the original main_align.py logic:
-        defects_scan = diff_mask_scan_1 * diff_mask_scan_2
+    mask (binary) — "positive + morpho open":
+      1. Only flag pixels where the scan has MORE edges than BOTH restorals
+         (both diffs strictly positive above threshold). This eliminates false
+         positives caused by a sharper restored version — when the restored is
+         sharper, both diffs are negative, their product is positive but the
+         pixel is NOT a defect.
+      2. Morphological opening with a small ellipse kernel removes isolated
+         single-pixel noise that survives the threshold.
 
     Returns:
         (mask_uint8, mask_raw_float32)
     """
-    mask_raw = diff_scan_vs_r1 * diff_scan_vs_r2          # float32 product
-    mask_bin = (mask_raw > threshold).astype(np.uint8) * 255
+    mask_raw = diff_scan_vs_r1 * diff_scan_vs_r2
+
+    # Both diffs must be positive — scan edges exceed both restorals
+    positive = (diff_scan_vs_r1 > threshold) & (diff_scan_vs_r2 > threshold)
+
+    # Remove isolated noise pixels with morphological opening
+    kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_kernel, morph_kernel))
+    mask_bin = cv2.morphologyEx(positive.astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel)
+
     return mask_bin, mask_raw.astype(np.float32)

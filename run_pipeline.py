@@ -341,6 +341,7 @@ def process_frame(
     r2_path: str,
     seg_dir: str,
     mask_threshold: float,
+    mask_morph: int = 3,
     save_failures: bool = True,
     save_corrected: bool = False,
     save_inpainted: bool = False,
@@ -397,7 +398,7 @@ def process_frame(
     # --- Defect mask ---
     diff1 = generate_gradient_difference_mask(scan_f, r1_aligned)
     diff2 = generate_gradient_difference_mask(scan_f, r2_aligned)
-    mask, mask_raw = compute_defect_mask(diff1, diff2, threshold=mask_threshold)
+    mask, mask_raw = compute_defect_mask(diff1, diff2, threshold=mask_threshold, morph_kernel=mask_morph)
 
     # --- Normalise mask_raw for saving (map to [0,1]) ---
     mr_min, mr_max = mask_raw.min(), mask_raw.max()
@@ -459,6 +460,7 @@ def run(cfg: dict, cli_overrides: dict):
     stride         = cfg.get("stride", 25)
     max_segments   = cfg.get("max_segments", None)
     mask_threshold   = cfg["mask"]["threshold"]
+    mask_morph       = cfg["mask"].get("morph_kernel", 3)
     save_failures    = cfg.get("save_failures",  True)
     save_corrected   = cfg.get("save_corrected", False)
     save_inpainted   = cfg.get("save_inpainted", False)
@@ -525,7 +527,7 @@ def run(cfg: dict, cli_overrides: dict):
     print(f"  Scene matching:  {sc.get('features', 'cnn').upper()} features  "
           f"(sim_threshold={sc.get('sim_threshold', 0.5)}, "
           f"tolerance=±{sc.get('consensus_tolerance', 3)})")
-    print(f"  Mask threshold:  {mask_threshold}")
+    print(f"  Mask threshold:  {mask_threshold}  (morph_kernel={mask_morph})")
     print()
     print(f"  Save failures:   {save_failures}")
     print(f"  Save corrected:  {save_corrected}")
@@ -537,49 +539,53 @@ def run(cfg: dict, cli_overrides: dict):
     # Carry forward the offset between segments
     current_offset = 0
 
-    for seg_idx, (seg_start, seg_end) in enumerate(segments):
-        print("=" * 60)
-        print(f"Segment {seg_idx + 1}/{len(segments)}  "
-              f"frames {seg_start}–{seg_end}  (offset so far: {current_offset:+d})")
-        print("=" * 60)
+    # Create the executor ONCE — workers are reused across all segments.
+    # This avoids spawning a fresh pool per segment and leaving zombies behind.
+    executor = ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_worker_init,
+        initargs=(save_inpainted, threads_per_worker),
+    )
 
-        # --- 1. Temporal offset for this segment ---
-        print("  Step 1: scene matching for temporal offset...")
-        seg_dir = _segment_dir(out_dir, seg_start, seg_end, cfg)
-        current_offset = estimate_segment_offset(
-            scan_path, r1_path,
-            seg_start, seg_end,
-            cfg, extractor,
-            fallback_offset=current_offset,
-            debug_dir=os.path.join(seg_dir, "debug"),
-        )
+    try:
+        for seg_idx, (seg_start, seg_end) in enumerate(segments):
+            print("=" * 60)
+            print(f"Segment {seg_idx + 1}/{len(segments)}  "
+                  f"frames {seg_start}–{seg_end}  (offset so far: {current_offset:+d})")
+            print("=" * 60)
 
-        # --- 2. Frame-level processing (parallel) ---
-        frame_nums = list(range(seg_start, seg_end, stride))
-        print(f"  Step 2: processing {len(frame_nums)} frames "
-              f"(every {stride} frames, offset={current_offset:+d}, workers={workers})...")
+            # --- 1. Temporal offset for this segment ---
+            print("  Step 1: scene matching for temporal offset...")
+            seg_dir = _segment_dir(out_dir, seg_start, seg_end, cfg)
+            current_offset = estimate_segment_offset(
+                scan_path, r1_path,
+                seg_start, seg_end,
+                cfg, extractor,
+                fallback_offset=current_offset,
+                debug_dir=os.path.join(seg_dir, "debug"),
+            )
 
-        # Build one kwargs dict per frame — picklable, no lama (loaded per-worker)
-        tasks = [dict(
-            frame_num=fn,
-            offset=current_offset,
-            scan_path=scan_path,
-            r1_path=r1_path,
-            r2_path=r2_path,
-            seg_dir=seg_dir,
-            mask_threshold=mask_threshold,
-            save_failures=save_failures,
-            save_corrected=save_corrected,
-            save_inpainted=save_inpainted,
-            inpaint_dilation=inpaint_dilation,
-        ) for fn in frame_nums]
+            # --- 2. Frame-level processing (parallel) ---
+            frame_nums = list(range(seg_start, seg_end, stride))
+            print(f"  Step 2: processing {len(frame_nums)} frames "
+                  f"(every {stride} frames, offset={current_offset:+d}, workers={workers})...")
 
-        saved = 0
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_worker_init,
-            initargs=(save_inpainted, threads_per_worker),
-        ) as executor:
+            tasks = [dict(
+                frame_num=fn,
+                offset=current_offset,
+                scan_path=scan_path,
+                r1_path=r1_path,
+                r2_path=r2_path,
+                seg_dir=seg_dir,
+                mask_threshold=mask_threshold,
+                mask_morph=mask_morph,
+                save_failures=save_failures,
+                save_corrected=save_corrected,
+                save_inpainted=save_inpainted,
+                inpaint_dilation=inpaint_dilation,
+            ) for fn in frame_nums]
+
+            saved = 0
             futures = {executor.submit(_frame_task, t): t["frame_num"] for t in tasks}
             with tqdm(total=len(futures), desc=f"  seg {seg_start}-{seg_end}") as pbar:
                 for fut in as_completed(futures):
@@ -591,7 +597,18 @@ def run(cfg: dict, cli_overrides: dict):
                         print(f"\n    [error] frame {fn}: {e}")
                     pbar.update(1)
 
-        print(f"  Saved {saved}/{len(frame_nums)} frames → {seg_dir}\n")
+            print(f"  Saved {saved}/{len(frame_nums)} frames → {seg_dir}\n")
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted — shutting down workers...")
+    finally:
+        # Cancel pending futures and terminate worker processes cleanly.
+        executor.shutdown(wait=False, cancel_futures=True)
+        # Hard-kill any workers that are still alive (e.g. stuck in ECC).
+        import multiprocessing as _mp
+        for child in _mp.active_children():
+            child.terminate()
+        print("Workers stopped.")
 
     print("Pipeline complete.")
 
