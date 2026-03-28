@@ -306,9 +306,18 @@ def _detect_scene_changes_windowed(
 _worker_lama = None
 
 
-def _worker_init(save_inpainted: bool):
-    """Called once when each worker process starts. Loads LaMa on CPU if needed."""
+def _worker_init(save_inpainted: bool, threads_per_worker: int):
+    """Called once when each worker process starts."""
     global _worker_lama
+
+    # Cap OpenCV's internal thread pool so N workers × M threads stays bounded.
+    cv2.setNumThreads(threads_per_worker)
+
+    # Same cap for OpenBLAS / numpy (used by colour transfer and scipy).
+    os.environ["OMP_NUM_THREADS"]        = str(threads_per_worker)
+    os.environ["OPENBLAS_NUM_THREADS"]   = str(threads_per_worker)
+    os.environ["MKL_NUM_THREADS"]        = str(threads_per_worker)
+
     if save_inpainted:
         # Force CPU — each worker loading LaMa on GPU would exhaust VRAM fast.
         import torch
@@ -455,6 +464,11 @@ def run(cfg: dict, cli_overrides: dict):
     save_inpainted   = cfg.get("save_inpainted", False)
     inpaint_dilation = cfg.get("inpaint_dilation", 3)
     workers          = cfg.get("workers", max(1, multiprocessing.cpu_count() - 1))
+    max_cores        = cfg.get("max_cores", None)
+    if max_cores is not None:
+        threads_per_worker = max(1, max_cores // workers)
+    else:
+        threads_per_worker = max(1, multiprocessing.cpu_count() // workers)
 
     # --- Video info ---
     print("=" * 60)
@@ -517,7 +531,7 @@ def run(cfg: dict, cli_overrides: dict):
     print(f"  Save corrected:  {save_corrected}")
     print(f"  Save inpainted:  {save_inpainted}"
           + (f"  (dilation={inpaint_dilation}px)" if save_inpainted else ""))
-    print(f"  Workers:         {workers}")
+    print(f"  Workers:         {workers}  ({threads_per_worker} threads/worker)")
     print("=" * 60 + "\n")
 
     # Carry forward the offset between segments
@@ -564,7 +578,7 @@ def run(cfg: dict, cli_overrides: dict):
         with ProcessPoolExecutor(
             max_workers=workers,
             initializer=_worker_init,
-            initargs=(save_inpainted,),
+            initargs=(save_inpainted, threads_per_worker),
         ) as executor:
             futures = {executor.submit(_frame_task, t): t["frame_num"] for t in tasks}
             with tqdm(total=len(futures), desc=f"  seg {seg_start}-{seg_end}") as pbar:
