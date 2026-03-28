@@ -4,12 +4,11 @@
 
 # --- Video paths ---
 videos:
-  scan:       "../NewTriAlign/videos/The.Shining.1980.35mm.Scan.FullScreen.HYBRID.OPEN.MATTE.1080p.mkv"
-  restored_1: "../NewTriAlign/videos/shining_restored-46.mkv"
-  restored_2: "../NewTriAlign/videos/shining_restored_copy2-38.mp4"
-
+  scan:       "/data/storage/users/priubrogent/filmdataset/videos/The.Shining.1980.35mm.Scan.FullScreen.HYBRID.OPEN.MATTE.1080p.mkv"
+  restored_1: "/data/storage/users/priubrogent/filmdataset/videos/shining_restored-46.mkv"
+  restored_2: "/data/storage/users/priubrogent/filmdataset/videos/shining_restored_copy2-38.mp4"
 # --- Output ---
-output_dir: "pipeline_output_parallel"
+output_dir: "pipeline_output_parallel_new"
 
 # --- Segment settings ---
 start_frame: 200           # First scan frame to process
