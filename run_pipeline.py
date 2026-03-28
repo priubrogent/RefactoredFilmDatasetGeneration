@@ -16,8 +16,10 @@ Usage:
 """
 
 import argparse
+import multiprocessing
 import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -26,6 +28,7 @@ import yaml
 from tqdm import tqdm
 
 from alignment import align_two_images, generate_gradient_difference_mask, compute_defect_mask
+from color_library import compute_color_matrix, apply_color_matrix
 from video_io import extract_frame, get_video_info
 from scene_matching import (
     CNNFeatureExtractor,
@@ -57,13 +60,34 @@ def _save_image(arr: np.ndarray, path: str):
     cv2.imwrite(path, arr)
 
 
-def _segment_dir(output_dir: str, start: int, end: int) -> str:
+def _segment_dir(output_dir: str, start: int, end: int, cfg: dict) -> str:
     d = os.path.join(output_dir, f"segment{start:06d}-{end:06d}")
-    for sub in ("scan", "restored_1", "restored_1_original",
-                "restored_2", "restored_2_original", "mask", "mask_raw",
-                "debug", "debug/alignment_failures"):
+    subs = ["scan", "restored_1", "restored_1_original",
+            "restored_2", "restored_2_original", "mask", "mask_raw", "debug"]
+    if cfg.get("save_failures", True):
+        subs.append("debug/alignment_failures")
+    if cfg.get("save_corrected", False):
+        subs += ["scan_corrected_r1", "scan_corrected_r2"]
+    if cfg.get("save_inpainted", False):
+        subs.append("inpainted")
+    for sub in subs:
         os.makedirs(os.path.join(d, sub), exist_ok=True)
     return d
+
+
+def _dilate_mask(mask: np.ndarray, px: int) -> np.ndarray:
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * px + 1, 2 * px + 1))
+    return cv2.dilate(mask, kernel)
+
+
+def _load_lama():
+    """Load LaMa inpainter. Returns None if not installed."""
+    try:
+        from simple_lama_inpainting import SimpleLama
+        return SimpleLama()
+    except ImportError:
+        print("[warn] simple-lama-inpainting not installed — --save-inpainted disabled.")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +296,26 @@ def _detect_scene_changes_windowed(
 
 
 # ---------------------------------------------------------------------------
+# Worker process initializer — loads heavy models once per process
+# ---------------------------------------------------------------------------
+
+# Module-level global so worker functions can access it without pickling
+_worker_lama = None
+
+
+def _worker_init(save_inpainted: bool):
+    """Called once when each worker process starts. Loads LaMa if needed."""
+    global _worker_lama
+    if save_inpainted:
+        _worker_lama = _load_lama()
+
+
+def _frame_task(kwargs: dict) -> bool:
+    """Top-level picklable wrapper — required for ProcessPoolExecutor."""
+    return process_frame(**kwargs, lama=_worker_lama)
+
+
+# ---------------------------------------------------------------------------
 # Per-frame processing
 # ---------------------------------------------------------------------------
 
@@ -283,8 +327,14 @@ def process_frame(
     r2_path: str,
     seg_dir: str,
     mask_threshold: float,
+    save_failures: bool = True,
+    save_corrected: bool = False,
+    save_inpainted: bool = False,
+    inpaint_dilation: int = 3,
+    lama=None,
 ):
     """Extract, align, mask, and save one frame triplet."""
+    tag          = f"{frame_num:06d}.png"
     failures_dir = os.path.join(seg_dir, "debug", "alignment_failures")
 
     # --- Extract frames ---
@@ -308,7 +358,6 @@ def process_frame(
     # Falls back to plain resize if ECC fails (NaN / non-convergence).
     # Failed frames are saved to debug/alignment_failures/ for inspection.
     h, w = scan_f.shape[:2]
-    tag  = f"{frame_num:06d}.png"
     r1_failed = r2_failed = False
 
     r1_aligned, _ = align_two_images(scan_f, r1_f)
@@ -324,7 +373,7 @@ def process_frame(
         r2_failed = True
 
     # Save failure evidence: scan + whichever restored(s) failed to align
-    if r1_failed or r2_failed:
+    if save_failures and (r1_failed or r2_failed):
         _save_image(scan_raw, os.path.join(failures_dir, f"{frame_num:06d}_scan.png"))
         if r1_failed:
             _save_image(r1_raw, os.path.join(failures_dir, f"{frame_num:06d}_r1.png"))
@@ -338,20 +387,38 @@ def process_frame(
 
     # --- Normalise mask_raw for saving (map to [0,1]) ---
     mr_min, mr_max = mask_raw.min(), mask_raw.max()
-    if mr_max > mr_min:
-        mask_raw_vis = ((mask_raw - mr_min) / (mr_max - mr_min)).astype(np.float32)
-    else:
-        mask_raw_vis = np.zeros_like(mask_raw)
+    mask_raw_vis = ((mask_raw - mr_min) / (mr_max - mr_min)).astype(np.float32) if mr_max > mr_min else np.zeros_like(mask_raw)
 
-    # --- Save ---
-    tag = f"{frame_num:06d}.png"
-    _save_image(scan_raw,                            os.path.join(seg_dir, "scan",                tag))
-    _save_image(r1_raw,                              os.path.join(seg_dir, "restored_1_original", tag))
-    _save_image(r2_raw,                              os.path.join(seg_dir, "restored_2_original", tag))
-    _save_image(r1_aligned,                          os.path.join(seg_dir, "restored_1",          tag))
-    _save_image(r2_aligned,                          os.path.join(seg_dir, "restored_2",          tag))
-    _save_image(mask,                                os.path.join(seg_dir, "mask",                tag))
-    _save_image(mask_raw_vis,                        os.path.join(seg_dir, "mask_raw",            tag))
+    # --- Core saves ---
+    _save_image(scan_raw,    os.path.join(seg_dir, "scan",                tag))
+    _save_image(r1_raw,      os.path.join(seg_dir, "restored_1_original", tag))
+    _save_image(r2_raw,      os.path.join(seg_dir, "restored_2_original", tag))
+    _save_image(r1_aligned,  os.path.join(seg_dir, "restored_1",          tag))
+    _save_image(r2_aligned,  os.path.join(seg_dir, "restored_2",          tag))
+    _save_image(mask,        os.path.join(seg_dir, "mask",                tag))
+    _save_image(mask_raw_vis, os.path.join(seg_dir, "mask_raw",           tag))
+
+    # --- Optional: colour-corrected scan (scan content, restored colour grade) ---
+    if save_corrected:
+        scan_rgb = cv2.cvtColor(scan_raw, cv2.COLOR_BGR2RGB)
+        r1_rgb   = cv2.cvtColor((r1_aligned * 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
+        r2_rgb   = cv2.cvtColor((r2_aligned * 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
+        H1 = compute_color_matrix(reference=r1_rgb, source=scan_rgb)
+        H2 = compute_color_matrix(reference=r2_rgb, source=scan_rgb)
+        corrected_r1 = cv2.cvtColor(apply_color_matrix(scan_rgb, H1), cv2.COLOR_RGB2BGR)
+        corrected_r2 = cv2.cvtColor(apply_color_matrix(scan_rgb, H2), cv2.COLOR_RGB2BGR)
+        _save_image(corrected_r1, os.path.join(seg_dir, "scan_corrected_r1", tag))
+        _save_image(corrected_r2, os.path.join(seg_dir, "scan_corrected_r2", tag))
+
+    # --- Optional: LaMa inpainting ---
+    if save_inpainted and lama is not None:
+        from PIL import Image
+        dilated       = _dilate_mask(mask, px=inpaint_dilation)
+        scan_pil      = Image.fromarray(cv2.cvtColor(scan_raw, cv2.COLOR_BGR2RGB))
+        mask_pil      = Image.fromarray(dilated)
+        inpainted     = lama(scan_pil, mask_pil)
+        inpainted_bgr = cv2.cvtColor(np.array(inpainted), cv2.COLOR_RGB2BGR)
+        _save_image(inpainted_bgr, os.path.join(seg_dir, "inpainted", tag))
 
     return True
 
@@ -377,7 +444,12 @@ def run(cfg: dict, cli_overrides: dict):
     segment_frames = cfg.get("segment_frames", 1440)
     stride         = cfg.get("stride", 25)
     max_segments   = cfg.get("max_segments", None)
-    mask_threshold = cfg["mask"]["threshold"]
+    mask_threshold   = cfg["mask"]["threshold"]
+    save_failures    = cfg.get("save_failures",  True)
+    save_corrected   = cfg.get("save_corrected", False)
+    save_inpainted   = cfg.get("save_inpainted", False)
+    inpaint_dilation = cfg.get("inpaint_dilation", 3)
+    workers          = cfg.get("workers", max(1, multiprocessing.cpu_count() - 1))
 
     # --- Video info ---
     print("=" * 60)
@@ -419,8 +491,29 @@ def run(cfg: dict, cli_overrides: dict):
         if max_segments and len(segments) >= max_segments:
             break
 
-    print(f"\n{len(segments)} segments to process  "
-          f"(segment_frames={segment_frames}, stride={stride})\n")
+    frames_per_seg = len(range(0, segment_frames, stride))
+    total_frames_est = frames_per_seg * len(segments)
+
+    print("\n" + "=" * 60)
+    print("PIPELINE SUMMARY")
+    print("=" * 60)
+    print(f"  Segments:        {len(segments)}  (frames {start_frame} → {segments[-1][1]})")
+    print(f"  Segment length:  {segment_frames} frames  (~{segment_frames / scan_info['fps']:.0f}s)")
+    print(f"  Stride:          every {stride} frames  (~{frames_per_seg} frames/segment)")
+    print(f"  Frames total:    ~{total_frames_est}")
+    print(f"  Output dir:      {out_dir}")
+    print()
+    print(f"  Scene matching:  {sc.get('features', 'cnn').upper()} features  "
+          f"(sim_threshold={sc.get('sim_threshold', 0.5)}, "
+          f"tolerance=±{sc.get('consensus_tolerance', 3)})")
+    print(f"  Mask threshold:  {mask_threshold}")
+    print()
+    print(f"  Save failures:   {save_failures}")
+    print(f"  Save corrected:  {save_corrected}")
+    print(f"  Save inpainted:  {save_inpainted}"
+          + (f"  (dilation={inpaint_dilation}px)" if save_inpainted else ""))
+    print(f"  Workers:         {workers}")
+    print("=" * 60 + "\n")
 
     # Carry forward the offset between segments
     current_offset = 0
@@ -433,7 +526,7 @@ def run(cfg: dict, cli_overrides: dict):
 
         # --- 1. Temporal offset for this segment ---
         print("  Step 1: scene matching for temporal offset...")
-        seg_dir = _segment_dir(out_dir, seg_start, seg_end)
+        seg_dir = _segment_dir(out_dir, seg_start, seg_end, cfg)
         current_offset = estimate_segment_offset(
             scan_path, r1_path,
             seg_start, seg_end,
@@ -442,24 +535,42 @@ def run(cfg: dict, cli_overrides: dict):
             debug_dir=os.path.join(seg_dir, "debug"),
         )
 
-        # --- 2. Frame-level processing ---
+        # --- 2. Frame-level processing (parallel) ---
         frame_nums = list(range(seg_start, seg_end, stride))
         print(f"  Step 2: processing {len(frame_nums)} frames "
-              f"(every {stride} frames, offset={current_offset:+d})...")
+              f"(every {stride} frames, offset={current_offset:+d}, workers={workers})...")
+
+        # Build one kwargs dict per frame — picklable, no lama (loaded per-worker)
+        tasks = [dict(
+            frame_num=fn,
+            offset=current_offset,
+            scan_path=scan_path,
+            r1_path=r1_path,
+            r2_path=r2_path,
+            seg_dir=seg_dir,
+            mask_threshold=mask_threshold,
+            save_failures=save_failures,
+            save_corrected=save_corrected,
+            save_inpainted=save_inpainted,
+            inpaint_dilation=inpaint_dilation,
+        ) for fn in frame_nums]
 
         saved = 0
-        for fn in tqdm(frame_nums, desc=f"  seg {seg_start}-{seg_end}"):
-            ok = process_frame(
-                frame_num=fn,
-                offset=current_offset,
-                scan_path=scan_path,
-                r1_path=r1_path,
-                r2_path=r2_path,
-                seg_dir=seg_dir,
-                mask_threshold=mask_threshold,
-            )
-            if ok:
-                saved += 1
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_worker_init,
+            initargs=(save_inpainted,),
+        ) as executor:
+            futures = {executor.submit(_frame_task, t): t["frame_num"] for t in tasks}
+            with tqdm(total=len(futures), desc=f"  seg {seg_start}-{seg_end}") as pbar:
+                for fut in as_completed(futures):
+                    try:
+                        if fut.result():
+                            saved += 1
+                    except Exception as e:
+                        fn = futures[fut]
+                        print(f"\n    [error] frame {fn}: {e}")
+                    pbar.update(1)
 
         print(f"  Saved {saved}/{len(frame_nums)} frames → {seg_dir}\n")
 
