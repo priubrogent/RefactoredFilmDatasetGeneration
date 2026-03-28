@@ -4,9 +4,9 @@
 
 # --- Video paths ---
 videos:
-  scan:       "/data/storage/users/priubrogent/filmdataset/videos/back_future/back_future_scan.mkv"
-  restored_1: "/data/storage/users/priubrogent/filmdataset/videos/back_future/back_future_restored_1.mkv"
-  restored_2: "/data/storage/users/priubrogent/filmdataset/videos/back_future/back_future_restored_2.mkv"
+  scan:       "/data/storage/users/priubrogent/filmdataset/videos/back_future/back_future_1_scan.mkv"
+  restored_1: "/data/storage/users/priubrogent/filmdataset/videos/back_future/back_future_1_restored_1.mkv"
+  restored_2: "/data/storage/users/priubrogent/filmdataset/videos/back_future/back_future_1_restored_2.mkv"
 # --- Output ---
 output_dir: "/data/storage/users/priubrogent/filmdataset/back_future_output"
 
