@@ -80,11 +80,14 @@ def _dilate_mask(mask: np.ndarray, px: int) -> np.ndarray:
     return cv2.dilate(mask, kernel)
 
 
-def _load_lama():
+def _load_lama(device=None):
     """Load LaMa inpainter. Returns None if not installed."""
     try:
         from simple_lama_inpainting import SimpleLama
-        return SimpleLama()
+        import torch
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return SimpleLama(device=device)
     except ImportError:
         print("[warn] simple-lama-inpainting not installed — --save-inpainted disabled.")
         return None
@@ -304,10 +307,12 @@ _worker_lama = None
 
 
 def _worker_init(save_inpainted: bool):
-    """Called once when each worker process starts. Loads LaMa if needed."""
+    """Called once when each worker process starts. Loads LaMa on CPU if needed."""
     global _worker_lama
     if save_inpainted:
-        _worker_lama = _load_lama()
+        # Force CPU — each worker loading LaMa on GPU would exhaust VRAM fast.
+        import torch
+        _worker_lama = _load_lama(device=torch.device("cpu"))
 
 
 def _frame_task(kwargs: dict) -> bool:
