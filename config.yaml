@@ -40,10 +40,12 @@ alignment:
 # --- Defect mask ---
 mask:
   threshold: 0.10         # Gradient difference threshold for defect flagging
+  morph_kernel: 3         # Morphological opening kernel size (removes isolated noise pixels)
 
 # --- Parallelism ---
-workers: null           # Worker processes for frame-level parallelism
-                        # null = cpu_count - 1 (auto), set to 1 to disable
+workers: 2              # Worker processes for frame-level parallelism
+max_cores: 10           # Hard cap on total CPU cores used (workers × threads/worker)
+                        # e.g. workers=2, max_cores=10 → 5 threads per worker
 
 # --- Optional outputs ---
 save_failures:  false    # Save ECC-failed frames to debug/alignment_failures/
