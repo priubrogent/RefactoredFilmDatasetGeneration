@@ -582,6 +582,11 @@ def run(cfg: dict, cli_overrides: dict):
 # ---------------------------------------------------------------------------
 
 def main():
+    # Must be set before any CUDA/torch usage in the main process.
+    # 'spawn' starts workers fresh (no inherited CUDA context), which is
+    # required when torch is imported in the parent process.
+    multiprocessing.set_start_method("spawn", force=True)
+
     parser = argparse.ArgumentParser(description="Film restoration dataset pipeline")
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config file")
     parser.add_argument("--start-frame", type=int, default=None,
