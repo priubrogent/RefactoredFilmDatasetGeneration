@@ -301,6 +301,59 @@ def _to_tensors(
     return inp_t, mask_t
 
 
+def load_frame_as_patches(
+    scan_p:     str,
+    r1_p:       str,
+    r2_p:       str,
+    pl_cfg:     "PseudoLabelConfig",
+    patch_size: int,
+    n_crops:    int = 3,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """
+    Load a specific aligned triplet and return n_crops evenly-spaced patches.
+
+    Crops are taken along the diagonal (top-left → bottom-right) so each crop
+    shows a different region of the frame.
+
+    Returns:
+        (inputs, targets): tensors of shape (n_crops, 9, P, P) and (n_crops, 1, P, P)
+        None if any image fails to load.
+    """
+    scan = cv2.imread(scan_p)
+    r1   = cv2.imread(r1_p)
+    r2   = cv2.imread(r2_p)
+    if scan is None or r1 is None or r2 is None:
+        return None
+
+    mask, _ = compute_pseudo_label(scan, r1, r2, pl_cfg)
+
+    h, w = scan.shape[:2]
+    p    = patch_size
+    ys   = np.linspace(0, max(0, h - p), n_crops, dtype=int)
+    xs   = np.linspace(0, max(0, w - p), n_crops, dtype=int)
+
+    inps, masks = [], []
+    for y, x in zip(ys, xs):
+        s  = scan[y:y+p, x:x+p]
+        r1_ = r1[y:y+p, x:x+p]
+        r2_ = r2[y:y+p, x:x+p]
+        m  = mask[y:y+p, x:x+p]
+        # Pad if frame is smaller than patch size
+        if s.shape[0] < p or s.shape[1] < p:
+            ph = max(0, p - s.shape[0])
+            pw = max(0, p - s.shape[1])
+            bd = cv2.BORDER_REFLECT
+            s   = cv2.copyMakeBorder(s,   0, ph, 0, pw, bd)
+            r1_ = cv2.copyMakeBorder(r1_, 0, ph, 0, pw, bd)
+            r2_ = cv2.copyMakeBorder(r2_, 0, ph, 0, pw, bd)
+            m   = cv2.copyMakeBorder(m,   0, ph, 0, pw, bd)
+        inp_t, mask_t = _to_tensors(s, r1_, r2_, m)
+        inps.append(inp_t)
+        masks.append(mask_t)
+
+    return torch.stack(inps), torch.stack(masks)
+
+
 def _fake_r2(tgt: np.ndarray) -> np.ndarray:
     """Lightly perturb the clean target to use as a fake second restoration."""
     r2 = tgt.astype(np.float32)

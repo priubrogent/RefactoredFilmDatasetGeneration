@@ -38,15 +38,16 @@ training:
   num_workers: 4              # Set to 0 if DataLoader hangs; spawn context handles CUDA fork
 
   # Phase 1 — supervised on synthetic data
+  # Effective batch = batch_size × patches_per_frame (e.g. 2×32 = 64 patches/step)
   phase1_epochs: 15
   phase1_lr: 1.0e-3
-  phase1_batch_size: 8
+  phase1_batch_size: 2
   phase1_label_threshold: 15.0  # pixel diff (0-255) to binarise synthetic labels
 
   # Phase 2 — self-supervised on real pipeline data
   phase2_epochs: 40
   phase2_lr: 3.0e-4
-  phase2_batch_size: 8
+  phase2_batch_size: 2
 
   # Loss weights
   bce_weight: 1.0
@@ -62,8 +63,15 @@ training:
 wandb:
   project: "film-defect-detection"
   entity: null            # set to your wandb username / team
-  log_images_every: 5     # log sample grids every N epochs
-  num_log_samples: 4      # number of samples in logged image grid
+  log_images_every: 5     # log val_samples grid every N epochs (per-epoch val snapshots)
+
+  # Probe panels — logged every epoch across both phases
+  probe_specific_frames: [400, 450, 1000]   # frame numbers to always track
+  probe_crops_per_specific: 4               # diagonal crops per specific frame
+  probe_n_real_train: 10                    # random frames from real train half
+  probe_n_real_val: 10                      # random frames from real val half
+  probe_n_synthetic_train: 8               # samples from synthetic train split
+  probe_n_synthetic_val: 8                 # samples from synthetic test split
 
 # --- Checkpoints ---
 checkpoint:

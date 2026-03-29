@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 import wandb
 
-from dataset import FilmTripletDataset, SyntheticFilmDataset
+from dataset import FilmTripletDataset, SyntheticFilmDataset, load_frame_as_patches
 from model import UNet, build_model, count_parameters
 from pseudo_labels import PseudoLabelConfig
 
@@ -143,83 +143,73 @@ def _red_overlay(bgr: np.ndarray, mask: np.ndarray, alpha: float = 0.5) -> np.nd
 
 
 # ---------------------------------------------------------------------------
-# Real-frame probe — fixed batch logged every epoch in both phases
+# Probe system — fixed images logged every epoch across both phases
+#
+# Five panels in wandb, each logged to a stable key so the image history
+# slider shows the full training timeline:
+#   probe/real_specific   — specific named frames (e.g. 400, 450, 1000),
+#                           multiple crops per frame
+#   probe/real_train      — random frames from the train portion
+#   probe/real_val        — random frames from the val portion
+#   probe/synthetic_train — samples from the synthetic train split
+#   probe/synthetic_val   — samples from the synthetic test split
+#
+# Each row in a panel:  scan | r1 | pseudo/GT label | soft prediction
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def make_probe_grid(
-    inputs:    torch.Tensor,   # B×9×H×W  — real frames
-    targets:   torch.Tensor,   # B×1×H×W  — pseudo-labels
-    logits:    torch.Tensor,   # B×1×H×W  — current model output
+def _probe_grid(
+    inputs:    torch.Tensor,
+    targets:   torch.Tensor,
+    logits:    torch.Tensor,
     phase_tag: str,
     epoch:     int,
-    n:         int = 4,
+    title:     str,
 ) -> "wandb.Image":
-    """
-    Build a wandb image grid for the fixed real-frame probe.
-
-    Each row (one sample):
-        scan  |  r1  |  pseudo-label overlay  |  prediction (soft heatmap)
-
-    Because the same probe frames are logged every epoch across both phases,
-    wandb's image history lets you scrub through time and see exactly how
-    the model predictions on real film change as training progresses from
-    synthetic (phase 1) to real (phase 2).
-    """
-    import cv2
-
-    n = min(n, inputs.shape[0])
+    """One wandb image: every row is one sample (scan|r1|label|soft-pred)."""
+    n = inputs.shape[0]
     rows = []
     for i in range(n):
-        scan = (inputs[i, :3].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        r1   = (inputs[i, 3:6].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        pseudo = (targets[i, 0].cpu().numpy() * 255).astype(np.uint8)
-        prob   = torch.sigmoid(logits[i, 0]).cpu().numpy()          # float [0,1]
+        scan   = (inputs[i, :3].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        r1     = (inputs[i, 3:6].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        label  = (targets[i, 0].cpu().numpy() * 255).astype(np.uint8)
+        prob   = torch.sigmoid(logits[i, 0]).cpu().numpy()
 
-        pseudo_overlay = _red_overlay(scan, pseudo)
-        scan_rgb   = cv2.cvtColor(scan,           cv2.COLOR_BGR2RGB)
-        r1_rgb     = cv2.cvtColor(r1,             cv2.COLOR_BGR2RGB)
-        pseudo_rgb = cv2.cvtColor(pseudo_overlay, cv2.COLOR_BGR2RGB)
-
-        # Soft prediction as plasma heatmap blended over scan
-        heat = cv2.applyColorMap((prob * 255).astype(np.uint8), cv2.COLORMAP_PLASMA)
+        label_ov   = _red_overlay(scan, label)
+        heat       = cv2.applyColorMap((prob * 255).astype(np.uint8), cv2.COLORMAP_PLASMA)
         pred_blend = cv2.addWeighted(scan, 0.5, heat, 0.5, 0)
-        pred_rgb   = cv2.cvtColor(pred_blend, cv2.COLOR_BGR2RGB)
 
-        rows.append(np.concatenate([scan_rgb, r1_rgb, pseudo_rgb, pred_rgb], axis=1))
+        rows.append(np.concatenate([
+            cv2.cvtColor(scan,       cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(r1,         cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(label_ov,   cv2.COLOR_BGR2RGB),
+            cv2.cvtColor(pred_blend, cv2.COLOR_BGR2RGB),
+        ], axis=1))
 
     grid = np.concatenate(rows, axis=0)
-    caption = (
-        f"[{phase_tag} · epoch {epoch}]  "
-        "scan  |  r1  |  pseudo-label  |  prediction (soft)"
-    )
+    caption = f"[{phase_tag} · ep {epoch}] {title}  —  scan | r1 | label | pred"
     return wandb.Image(grid, caption=caption)
 
 
 @torch.no_grad()
-def log_probe_to_wandb(
-    model:      nn.Module,
-    probe:      tuple[torch.Tensor, torch.Tensor],  # (inputs, targets) on CPU
-    device:     torch.device,
-    phase_tag:  str,
-    epoch:      int,
-    num_log:    int,
+def log_all_probes(
+    model:     nn.Module,
+    probes:    dict,          # {wandb_key: (inputs CPU, targets CPU)}
+    device:    torch.device,
+    phase_tag: str,
+    epoch:     int,
 ) -> None:
-    """Run model on the fixed real-frame probe and log the grid to wandb."""
-    inputs, targets = probe
-    # Probe items come from the dataset which now returns (N, 9, H, W) — flatten
-    if inputs.dim() == 5:
-        B, N = inputs.shape[:2]
-        inputs  = inputs.view(B * N, *inputs.shape[2:])
-        targets = targets.view(B * N, *targets.shape[2:])
-    inputs  = inputs.to(device)
-    targets = targets.to(device)
-
+    """Run the model on every probe panel and log all to wandb in one call."""
     model.eval()
-    logits = model(inputs)
-
-    grid = make_probe_grid(inputs, targets, logits, phase_tag, epoch, n=num_log)
-    wandb.log({"probe/real_frames": grid, "epoch": epoch})
+    log_dict = {"epoch": epoch}
+    for key, (inputs, targets) in probes.items():
+        inputs  = inputs.to(device)
+        targets = targets.to(device)
+        logits  = model(inputs)
+        # title = last part of the key (e.g. "real_specific")
+        title = key.split("/")[-1].replace("_", " ")
+        log_dict[key] = _probe_grid(inputs, targets, logits, phase_tag, epoch, title)
+    wandb.log(log_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -227,13 +217,14 @@ def log_probe_to_wandb(
 # ---------------------------------------------------------------------------
 
 def run_epoch(
-    model:     nn.Module,
-    loader:    DataLoader,
-    optimizer: torch.optim.Optimizer | None,
-    bce_fn:    nn.BCEWithLogitsLoss,
-    cfg_train: dict,
-    device:    torch.device,
-    phase_tag: str,
+    model:      nn.Module,
+    loader:     DataLoader,
+    optimizer:  torch.optim.Optimizer | None,
+    bce_fn:     nn.BCEWithLogitsLoss,
+    cfg_train:  dict,
+    device:     torch.device,
+    phase_tag:  str,
+    global_step: list[int] | None = None,  # mutable [step] counter for batch logging
 ) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]:
     training = optimizer is not None
     model.train(training)
@@ -284,6 +275,15 @@ def run_epoch(
             pbar.set_postfix(loss=f"{totals['loss']/max(n,1):.4f}",
                              f1=f"{totals.get('f1',0)/max(n,1):.3f}")
 
+            if training and global_step is not None:
+                wandb.log({
+                    f"{phase_tag}/batch/loss": loss.item(),
+                    f"{phase_tag}/batch/bce":  loss_parts["bce"],
+                    f"{phase_tag}/batch/dice": loss_parts["dice"],
+                    "batch_step": global_step[0],
+                })
+                global_step[0] += 1
+
     for k in totals:
         totals[k] /= max(n, 1)
 
@@ -302,7 +302,7 @@ def train_phase(
     cfg:          dict,
     device:       torch.device,
     start_epoch:  int = 0,
-    probe:        tuple[torch.Tensor, torch.Tensor] | None = None,
+    probes:       dict | None = None,
 ) -> None:
     cfg_train = cfg["training"]
     cfg_wandb = cfg.get("wandb", {})
@@ -311,8 +311,9 @@ def train_phase(
     lr     = cfg_train[f"phase{phase}_lr"]
     tag    = f"phase{phase}"
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    optimizer   = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler   = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    global_step = [0]  # mutable counter passed into run_epoch for batch-level logging
 
     pos_weight = torch.tensor([cfg_train.get("pos_weight", 15.0)], device=device)
     bce_fn     = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -327,7 +328,7 @@ def train_phase(
 
     for epoch in range(start_epoch, start_epoch + epochs):
         train_metrics, *_ = run_epoch(
-            model, train_loader, optimizer, bce_fn, cfg_train, device, tag
+            model, train_loader, optimizer, bce_fn, cfg_train, device, tag, global_step
         )
         val_metrics, val_inp, val_tgt, val_log = run_epoch(
             model, val_loader, None, bce_fn, cfg_train, device, tag
@@ -356,10 +357,10 @@ def train_phase(
 
         wandb.log(log_dict)
 
-        # Probe: fixed real frames logged every epoch so both phases are
-        # comparable in the same wandb panel ("probe/real_frames").
-        if probe is not None:
-            log_probe_to_wandb(model, probe, device, tag, epoch + 1, num_log)
+        # Probes: all panels logged every epoch — stable keys give a
+        # continuous timeline across both phases in wandb.
+        if probes:
+            log_all_probes(model, probes, device, tag, epoch + 1)
 
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
@@ -460,53 +461,134 @@ def make_synthetic_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
 
 
 # ---------------------------------------------------------------------------
-# Probe batch builder
+# Probe builder
 # ---------------------------------------------------------------------------
 
-def make_probe_batch(
-    cfg:    dict,
-    n:      int = 8,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+def make_all_probes(cfg: dict) -> dict:
     """
-    Load N fixed real triplets (no augmentation, deterministic) and return
-    them as CPU tensors ready to be passed into log_probe_to_wandb().
+    Build all probe panels once at startup. Returns:
+        {wandb_key: (inputs_cpu, targets_cpu)}
 
-    Samples are drawn evenly from across all available triplets so the probe
-    covers different scenes / movies.  Returns None if no real data is found.
+    Panels built:
+        probe/real_specific   — specific frame numbers from config
+        probe/real_train      — evenly-spaced frames from the train half
+        probe/real_val        — evenly-spaced frames from the val half
+        probe/synthetic_train — samples from synthetic train split
+        probe/synthetic_val   — samples from synthetic test split
     """
     cfg_data  = cfg["data"]
     cfg_pl    = cfg.get("pseudo_labels", {})
     cfg_train = cfg["training"]
+    cfg_wandb = cfg.get("wandb", {})
     pl_cfg    = PseudoLabelConfig.from_dict(cfg_pl)
+    patch_size = cfg_train["patch_size"]
 
-    # Build a no-augment dataset just to get the triplet list
-    ds = FilmTripletDataset(
+    probes: dict = {}
+
+    # ── 1. Specific named frames ───────────────────────────────────────────
+    specific_nums  = cfg_wandb.get("probe_specific_frames", [400, 450, 1000])
+    crops_per      = cfg_wandb.get("probe_crops_per_specific", 3)
+
+    sp_inps, sp_tgts = [], []
+    for frame_num in specific_nums:
+        fname = f"{frame_num:06d}.png"
+        found = False
+        for base in cfg_data["pipeline_dirs"]:
+            for seg in sorted(Path(base).glob("segment*")):
+                scan_p = str(seg / "scan"       / fname)
+                r1_p   = str(seg / "restored_1" / fname)
+                r2_p   = str(seg / "restored_2" / fname)
+                if Path(scan_p).exists() and Path(r1_p).exists() and Path(r2_p).exists():
+                    result = load_frame_as_patches(
+                        scan_p, r1_p, r2_p, pl_cfg, patch_size, n_crops=crops_per
+                    )
+                    if result is not None:
+                        inps, tgts = result
+                        sp_inps.append(inps)
+                        sp_tgts.append(tgts)
+                        print(f"  [probe] frame {frame_num}: {crops_per} crops from {seg.name}")
+                        found = True
+                    break
+            if found:
+                break
+        if not found:
+            print(f"  [probe] frame {frame_num}: not found in any segment")
+
+    if sp_inps:
+        probes["probe/real_specific"] = (
+            torch.cat(sp_inps, dim=0),
+            torch.cat(sp_tgts, dim=0),
+        )
+
+    # ── 2. Real train / val random frames ──────────────────────────────────
+    n_train_probe = cfg_wandb.get("probe_n_real_train", 8)
+    n_val_probe   = cfg_wandb.get("probe_n_real_val",   8)
+
+    full_ds = FilmTripletDataset(
         pipeline_dirs=cfg_data["pipeline_dirs"],
-        patch_size=cfg_train["patch_size"],
-        patches_per_frame=1,          # one crop per frame
+        patch_size=patch_size,
+        patches_per_frame=1,
         pl_cfg=pl_cfg,
         min_coverage=cfg_pl.get("min_coverage", 0.0005),
         max_coverage=cfg_pl.get("max_coverage", 0.20),
         augment=False,
-        seed=0,                       # fixed seed → same frames every run
+        seed=1,
     )
 
-    if len(ds) == 0:
-        print("[probe] no real data found — probe disabled")
-        return None
+    if len(full_ds) > 0:
+        val_split = cfg_data.get("val_split", 0.5)
+        n_total   = len(full_ds)
+        n_tr      = max(1, int(n_total * (1 - val_split)))
 
-    # Evenly spaced indices across the full dataset
-    indices = np.linspace(0, len(ds) - 1, n, dtype=int).tolist()
+        for indices, key, n_probe in [
+            (np.linspace(0,    n_tr - 1,         min(n_train_probe, n_tr),             dtype=int), "probe/real_train", n_train_probe),
+            (np.linspace(n_tr, n_total - 1,      min(n_val_probe,   n_total - n_tr),   dtype=int), "probe/real_val",   n_val_probe),
+        ]:
+            batch_inps, batch_tgts = [], []
+            for i in indices:
+                item = full_ds[int(i)]
+                if item is None:
+                    continue
+                inp, tgt = item          # (1, 9, H, W), (1, 1, H, W)
+                batch_inps.append(inp[0])
+                batch_tgts.append(tgt[0])
+            if batch_inps:
+                probes[key] = (torch.stack(batch_inps), torch.stack(batch_tgts))
+                print(f"  [probe] {key}: {len(batch_inps)} frames")
 
-    inputs_list, targets_list = [], []
-    for idx in indices:
-        inp, tgt = ds[idx]
-        inputs_list.append(inp)
-        targets_list.append(tgt)
+    # ── 3. Synthetic train / val ───────────────────────────────────────────
+    syn_dir        = cfg_data.get("synthetic_dir")
+    n_syn_train    = cfg_wandb.get("probe_n_synthetic_train", 6)
+    n_syn_val      = cfg_wandb.get("probe_n_synthetic_val",   6)
 
-    probe = (torch.stack(inputs_list), torch.stack(targets_list))
-    print(f"[probe] loaded {len(inputs_list)} fixed real frames for wandb probe")
-    return probe
+    if syn_dir:
+        for split, n_probe, key in [
+            ("train", n_syn_train, "probe/synthetic_train"),
+            ("test",  n_syn_val,   "probe/synthetic_val"),
+        ]:
+            syn_ds = SyntheticFilmDataset(
+                synthetic_dir=syn_dir,
+                split=split,
+                patch_size=patch_size,
+                patches_per_frame=1,
+                label_threshold=cfg_train.get("phase1_label_threshold", 15.0),
+                augment=False,
+                seed=1,
+            )
+            if len(syn_ds) == 0:
+                continue
+            indices = np.linspace(0, len(syn_ds) - 1, min(n_probe, len(syn_ds)), dtype=int)
+            s_inps, s_tgts = [], []
+            for i in indices:
+                inp, tgt = syn_ds[int(i)]   # (1, 9, H, W), (1, 1, H, W)
+                s_inps.append(inp[0])
+                s_tgts.append(tgt[0])
+            if s_inps:
+                probes[key] = (torch.stack(s_inps), torch.stack(s_tgts))
+                print(f"  [probe] {key}: {len(s_inps)} samples")
+
+    print(f"[probes] built {len(probes)} panels: {list(probes.keys())}")
+    return probes
 
 
 # ---------------------------------------------------------------------------
@@ -564,16 +646,16 @@ def main() -> None:
     run_phase1 = args.phase in (0, 1)
     run_phase2 = args.phase in (0, 2)
 
-    # Build the fixed real-frame probe once — used in both phases so that
-    # "probe/real_frames" in wandb shows a continuous timeline from
-    # synthetic pre-training all the way through real fine-tuning.
-    probe = make_probe_batch(cfg, n=cfg.get("wandb", {}).get("num_log_samples", 4))
+    # Build all probe panels once — logged every epoch across both phases
+    # so wandb's image history shows the full training timeline.
+    print("\n[probes] building probe panels...")
+    probes = make_all_probes(cfg)
 
     # --- Phase 1: synthetic ---
     if run_phase1 and cfg["data"].get("synthetic_dir"):
         print("\n=== Phase 1: synthetic pre-training ===")
         train_loader, val_loader = make_synthetic_loaders(cfg)
-        train_phase(1, model, train_loader, val_loader, cfg, device, start_epoch, probe)
+        train_phase(1, model, train_loader, val_loader, cfg, device, start_epoch, probes)
         # Save after phase 1 for phase 2 warm-start
         torch.save(
             {"epoch": cfg["training"]["phase1_epochs"], "model": model.state_dict()},
@@ -586,7 +668,7 @@ def main() -> None:
     if run_phase2:
         print("\n=== Phase 2: real-data self-supervised fine-tuning ===")
         train_loader, val_loader = make_real_loaders(cfg)
-        train_phase(2, model, train_loader, val_loader, cfg, device, probe=probe)
+        train_phase(2, model, train_loader, val_loader, cfg, device, probes=probes)
 
     wandb.finish()
     print("\nTraining complete.")
