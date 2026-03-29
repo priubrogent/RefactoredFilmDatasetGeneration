@@ -396,10 +396,13 @@ def make_real_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
     bs = cfg_train["phase2_batch_size"]
     nw = cfg_train.get("num_workers", 4)
 
+    ctx = "spawn" if nw > 0 else None
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              num_workers=nw, pin_memory=True, drop_last=True)
+                              num_workers=nw, pin_memory=True, drop_last=True,
+                              multiprocessing_context=ctx)
     val_loader   = DataLoader(val_ds, batch_size=bs, shuffle=False,
-                              num_workers=nw, pin_memory=True)
+                              num_workers=nw, pin_memory=True,
+                              multiprocessing_context=ctx)
     print(f"[real data] train={n_train}  val={n_val}")
     return train_loader, val_loader
 
@@ -430,10 +433,13 @@ def make_synthetic_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
     bs = cfg_train["phase1_batch_size"]
     nw = cfg_train.get("num_workers", 4)
 
+    ctx = "spawn" if nw > 0 else None
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,
-                              num_workers=nw, pin_memory=True, drop_last=True)
+                              num_workers=nw, pin_memory=True, drop_last=True,
+                              multiprocessing_context=ctx)
     val_loader   = DataLoader(val_ds, batch_size=bs, shuffle=False,
-                              num_workers=nw, pin_memory=True)
+                              num_workers=nw, pin_memory=True,
+                              multiprocessing_context=ctx)
     return train_loader, val_loader
 
 
