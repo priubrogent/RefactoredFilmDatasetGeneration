@@ -1,0 +1,70 @@
+# ============================================================
+# Defect Detection — Training Configuration
+# ============================================================
+
+# --- Data sources ---
+data:
+  # Real pipeline output directories (one per movie).
+  # First 50% of segments → train, last 50% → val (controlled by val_split below).
+  # Add more movies here as they become available.
+  pipeline_dirs:
+    - "/data/storage/users/priubrogent/filmdataset/shining_new_test"
+  # Synthetic paired dataset — set to null to skip phase 1
+  synthetic_dir: "/home/priubrogent/00_PROJ/01_FilmDataset/Original_dataset/FilmRestoration"
+  # Validation split: 0.50 = first half train / second half val (one movie)
+  val_split: 0.50
+  seed: 42
+
+# --- Pseudo-label generation (real triplets) ---
+pseudo_labels:
+  diff_colorspace: "lab"     # "lab" (perceptual) or "rgb"
+  local_norm_radius: 31      # Blur radius for local mean subtraction (0 = off)
+  threshold: 12.0            # Min scan-vs-restored diff to flag as defect (0–255 scale)
+  agreement_threshold: 18.0  # Max r1-r2 diff to treat them as "agreeing"
+  min_coverage: 0.0005       # Skip frames with < 0.05% defect pixels (probably clean)
+  max_coverage: 0.20         # Skip frames with > 20% (probably misaligned)
+
+# --- Model ---
+model:
+  in_channels: 9        # scan(3) + r1(3) + r2(3)
+  base_features: 32     # Feature maps at first encoder block
+  depth: 4              # UNet depth (number of down/up-sample stages)
+
+# --- Training ---
+training:
+  patch_size: 256
+  patches_per_frame: 8        # Random crops extracted per frame per epoch
+  num_workers: 4
+
+  # Phase 1 — supervised on synthetic data
+  phase1_epochs: 15
+  phase1_lr: 1.0e-3
+  phase1_batch_size: 8
+  phase1_label_threshold: 15.0  # pixel diff (0-255) to binarise synthetic labels
+
+  # Phase 2 — self-supervised on real pipeline data
+  phase2_epochs: 40
+  phase2_lr: 3.0e-4
+  phase2_batch_size: 8
+
+  # Loss weights
+  bce_weight: 1.0
+  dice_weight: 1.0
+  tv_weight: 0.05        # Total-variation regulariser on predicted mask
+
+  # BCE pos_weight — defects are sparse, upweight positives
+  pos_weight: 15.0
+
+  augment: true
+
+# --- Wandb ---
+wandb:
+  project: "film-defect-detection"
+  entity: null            # set to your wandb username / team
+  log_images_every: 5     # log sample grids every N epochs
+  num_log_samples: 4      # number of samples in logged image grid
+
+# --- Checkpoints ---
+checkpoint:
+  dir: "checkpoints"
+  save_every: 5           # epochs between saves
