@@ -33,8 +33,9 @@ model:
 # --- Training ---
 training:
   patch_size: 256
-  patches_per_frame: 8        # Random crops extracted per frame per epoch
-  num_workers: 4
+  patches_per_frame: 32       # Random crops extracted per frame per epoch
+                              # Higher = fewer disk reads per epoch (amortises PNG IO)
+  num_workers: 4              # Set to 0 if DataLoader hangs; spawn context handles CUDA fork
 
   # Phase 1 — supervised on synthetic data
   phase1_epochs: 15

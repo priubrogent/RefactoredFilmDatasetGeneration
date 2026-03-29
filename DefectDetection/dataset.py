@@ -98,11 +98,15 @@ class FilmTripletDataset(Dataset):
         )
 
     def __len__(self) -> int:
-        return len(self.triplets) * self.patches_per_frame
+        return len(self.triplets)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        triplet_idx = idx // self.patches_per_frame
-        scan_p, r1_p, r2_p = self.triplets[triplet_idx]
+        """
+        Read each frame ONCE and return all patches_per_frame crops together.
+        Shape: (N, 9, H, W) and (N, 1, H, W).
+        run_epoch flattens these back to (B*N, ...) after collation.
+        """
+        scan_p, r1_p, r2_p = self.triplets[idx]
 
         scan = cv2.imread(scan_p)
         r1   = cv2.imread(r1_p)
@@ -113,20 +117,24 @@ class FilmTripletDataset(Dataset):
 
         mask, coverage = compute_pseudo_label(scan, r1, r2, self.pl_cfg)
 
-        # Filter frames outside plausible coverage range
         if not (self.min_coverage <= coverage <= self.max_coverage):
             return self._zeros()
 
-        scan, r1, r2, mask = _random_crop(scan, r1, r2, mask, self.patch_size)
+        inp_patches, mask_patches = [], []
+        for _ in range(self.patches_per_frame):
+            s, r1_, r2_, m = _random_crop(scan, r1, r2, mask, self.patch_size)
+            if self.augment:
+                s, r1_, r2_, m = _geometric_augment(s, r1_, r2_, m)
+            inp_t, mask_t = _to_tensors(s, r1_, r2_, m)
+            inp_patches.append(inp_t)
+            mask_patches.append(mask_t)
 
-        if self.augment:
-            scan, r1, r2, mask = _geometric_augment(scan, r1, r2, mask)
-
-        return _to_tensors(scan, r1, r2, mask)
+        return torch.stack(inp_patches), torch.stack(mask_patches)  # (N,9,H,W), (N,1,H,W)
 
     def _zeros(self) -> tuple[torch.Tensor, torch.Tensor]:
         p = self.patch_size
-        return torch.zeros(9, p, p), torch.zeros(1, p, p)
+        n = self.patches_per_frame
+        return torch.zeros(n, 9, p, p), torch.zeros(n, 1, p, p)
 
 
 # ---------------------------------------------------------------------------
@@ -181,34 +189,33 @@ class SyntheticFilmDataset(Dataset):
         print(f"[SyntheticFilmDataset] {len(self.pairs)} pairs ({split})")
 
     def __len__(self) -> int:
-        return len(self.pairs) * self.patches_per_frame
+        return len(self.pairs)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        pair_idx = idx // self.patches_per_frame
-        inp_p, tgt_p = self.pairs[pair_idx]
+        """Read each image ONCE, return all patches_per_frame crops stacked."""
+        inp_p, tgt_p = self.pairs[idx]
 
         inp = cv2.imread(inp_p)
         tgt = cv2.imread(tgt_p)
 
         if inp is None or tgt is None:
-            p = self.patch_size
-            return torch.zeros(9, p, p), torch.zeros(1, p, p)
+            p, n = self.patch_size, self.patches_per_frame
+            return torch.zeros(n, 9, p, p), torch.zeros(n, 1, p, p)
 
-        # Ground-truth label from abs pixel diff
-        diff  = np.linalg.norm(
-            inp.astype(np.float32) - tgt.astype(np.float32), axis=2
-        )
+        diff  = np.linalg.norm(inp.astype(np.float32) - tgt.astype(np.float32), axis=2)
         label = (diff > self.label_threshold).astype(np.uint8) * 255
+        r2    = _fake_r2(tgt)
 
-        # Fake R2: target + light jitter
-        r2 = _fake_r2(tgt)
+        inp_patches, mask_patches = [], []
+        for _ in range(self.patches_per_frame):
+            i, t, r, l = _random_crop(inp, tgt, r2, label, self.patch_size)
+            if self.augment:
+                i, t, r, l = _geometric_augment(i, t, r, l)
+            inp_t, mask_t = _to_tensors(i, t, r, l)
+            inp_patches.append(inp_t)
+            mask_patches.append(mask_t)
 
-        inp, tgt, r2, label = _random_crop(inp, tgt, r2, label, self.patch_size)
-
-        if self.augment:
-            inp, tgt, r2, label = _geometric_augment(inp, tgt, r2, label)
-
-        return _to_tensors(inp, tgt, r2, label)
+        return torch.stack(inp_patches), torch.stack(mask_patches)  # (N,9,H,W), (N,1,H,W)
 
 
 # ---------------------------------------------------------------------------

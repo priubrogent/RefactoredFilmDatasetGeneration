@@ -207,6 +207,11 @@ def log_probe_to_wandb(
 ) -> None:
     """Run model on the fixed real-frame probe and log the grid to wandb."""
     inputs, targets = probe
+    # Probe items come from the dataset which now returns (N, 9, H, W) — flatten
+    if inputs.dim() == 5:
+        B, N = inputs.shape[:2]
+        inputs  = inputs.view(B * N, *inputs.shape[2:])
+        targets = targets.view(B * N, *targets.shape[2:])
     inputs  = inputs.to(device)
     targets = targets.to(device)
 
@@ -248,6 +253,11 @@ def run_epoch(
     with ctx:
         pbar = tqdm(loader, desc=f"  {phase_tag} {mode}", leave=False, dynamic_ncols=True)
         for inputs, targets in pbar:
+            # Dataset returns (B, N, 9, H, W) — flatten patch dim into batch dim
+            if inputs.dim() == 5:
+                B, N = inputs.shape[:2]
+                inputs  = inputs.view(B * N, *inputs.shape[2:])
+                targets = targets.view(B * N, *targets.shape[2:])
             inputs  = inputs.to(device)
             targets = targets.to(device)
 
