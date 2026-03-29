@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader, ConcatDataset, random_split, Subset
+from tqdm import tqdm
 
 import wandb
 
@@ -242,9 +243,11 @@ def run_epoch(
 
     last_inp, last_tgt, last_log = None, None, None
 
+    mode = "train" if training else "val"
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
-        for inputs, targets in loader:
+        pbar = tqdm(loader, desc=f"  {phase_tag} {mode}", leave=False, dynamic_ncols=True)
+        for inputs, targets in pbar:
             inputs  = inputs.to(device)
             targets = targets.to(device)
 
@@ -267,6 +270,9 @@ def run_epoch(
             last_inp = inputs.detach()[:4]
             last_tgt = targets.detach()[:4]
             last_log = logits.detach()[:4]
+
+            pbar.set_postfix(loss=f"{totals['loss']/max(n,1):.4f}",
+                             f1=f"{totals.get('f1',0)/max(n,1):.3f}")
 
     for k in totals:
         totals[k] /= max(n, 1)
