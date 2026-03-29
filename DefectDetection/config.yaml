@@ -10,7 +10,7 @@ data:
   pipeline_dirs:
     - "/data/storage/users/priubrogent/filmdataset/shining_new_test"
   # Synthetic paired dataset — set to null to skip phase 1
-  synthetic_dir: "/home/priubrogent/00_PROJ/01_FilmDataset/Original_dataset/FilmRestoration"
+  synthetic_dir: "/data/storage/datasets/FilmRestoration"
   # Validation split: 0.50 = first half train / second half val (one movie)
   val_split: 0.50
   seed: 42
