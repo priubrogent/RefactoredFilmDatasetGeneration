@@ -1,0 +1,63 @@
+# ============================================================
+# Film Dataset Pipeline — Configuration
+# ============================================================
+
+# --- Video paths ---
+videos:
+  scan:       "/data/storage/users/priubrogent/filmdataset/videos/enter_dragon/enter_dragon_scan.mkv"
+  restored_1: "/data/storage/users/priubrogent/filmdataset/videos/enter_dragon/enter_dragon_restored_1.mp4"
+  restored_2: "/data/storage/users/priubrogent/filmdataset/videos/enter_dragon/enter_dragon_restored_2.mkv"
+# --- Output ---
+output_dir: "/data/storage/users/priubrogent/filmdataset/enter_dragon_output"
+
+# --- Segment settings ---
+start_frame: 200           # First scan frame to process
+segment_frames: 1440     # Frames per segment (1440 ≈ 60 s at 24 fps)
+stride: 200               # Extract 1 frame every N frames within a segment
+                         # (e.g. stride=25 → ~57 frames per 1440-frame segment)
+max_segments: null       # null = process all segments; set an int to limit
+
+# --- Scene matching (temporal offset estimation per segment) ---
+scene_matching:
+  max_frames: 1440          # Max frames to scan for scene cuts per segment
+  threshold: 30.0           # Histogram diff threshold to flag a cut
+  max_scenes: 20            # Max cuts to use per segment
+  frames_after_cut: 5       # Use frame N after each cut as representative
+  sim_threshold: 0.50       # Minimum CNN similarity to accept a scene match
+  consensus_tolerance: 3    # RANSAC ±tolerance when voting for best offset
+  features: "cnn"           # "cnn" (MobileNetV2) or "histogram" (fallback)
+  cache_dir: ".scene_cache" # Cache directory for scene detection results
+  use_cache: true           # Set false to force recomputation
+
+# --- Alignment ---
+alignment:
+  ecc_max_iter: 5000      # ECC termination: max iterations
+  ecc_eps: 1.0e-6         # ECC termination: epsilon
+  ecc_gaussfilt: 1        # Gaussian filter size for ECC (0 = none)
+  min_cc: 0.50            # Min ECC correlation coefficient to accept warp
+
+# --- Defect mask ---
+mask:
+  threshold: 0.10         # Gradient difference threshold for defect flagging
+  morph_kernel: 3         # Morphological opening kernel size (removes isolated noise pixels)
+
+# --- Parallelism ---
+workers: 2              # Worker processes for frame-level parallelism
+max_cores: 10           # Hard cap on total CPU cores used (workers × threads/worker)
+                        # e.g. workers=2, max_cores=10 → 5 threads per worker
+
+# --- Optional outputs ---
+save_failures:  false    # Save ECC-failed frames to debug/alignment_failures/
+save_corrected: true   # Save scan with each restored's colour transferred
+                        # → scan_corrected_r1/, scan_corrected_r2/
+save_inpainted: true   # Save LaMa-inpainted scan using the defect mask
+                        # Requires: pip install simple-lama-inpainting
+inpaint_dilation: 3     # Mask dilation radius in pixels before inpainting
+
+# --- Device ---
+device: "auto"            # "auto" = use CUDA if available, else CPU
+
+wandb:
+  enabled: true
+  project: "film-restoration-pipeline"
+  run_name: "enter_dragon"  # optional

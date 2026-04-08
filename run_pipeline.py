@@ -19,11 +19,13 @@ import argparse
 import multiprocessing
 import os
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
 import numpy as np
+import wandb
 import yaml
 from tqdm import tqdm
 
@@ -80,6 +82,20 @@ def _dilate_mask(mask: np.ndarray, px: int) -> np.ndarray:
     return cv2.dilate(mask, kernel)
 
 
+def _format_time(seconds: float) -> str:
+    """Format seconds into human-readable string (e.g., '1h 23m 45s')."""
+    if seconds < 0:
+        return "0s"
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours}h {minutes}m {secs}s"
+    elif minutes > 0:
+        return f"{minutes}m {secs}s"
+    else:
+        return f"{secs}s"
+
+
 def _load_lama(device=None):
     """Load LaMa inpainter. Returns None if not installed."""
     try:
@@ -99,18 +115,23 @@ def _load_lama(device=None):
 
 def estimate_segment_offset(
     scan_path: str,
-    restored_path: str,
+    r1_path: str,
+    r2_path: str,
     seg_start: int,
     seg_end: int,
     cfg: dict,
     extractor,
-    fallback_offset: int,
+    fallback_offset_r1: int,
+    fallback_offset_r2: int,
     debug_dir: str = None,
-) -> int:
+) -> tuple[int, int]:
     """
-    Run scene matching within [seg_start, seg_end) of both videos and return
-    the best temporal offset (restored = scan + offset).
+    Run scene matching within [seg_start, seg_end) for both restored videos
+    against the scan and return separate offsets for each.
 
+    Returns (offset_r1, offset_r2).
+
+    Debug visualizations are saved for both.
     Uses caching so re-runs are fast.
     """
     sc = cfg["scene_matching"]
@@ -139,19 +160,8 @@ def estimate_segment_offset(
         _save_cache(cache_file, result)
         return result
 
-    scenes_a_idx, scenes_a_imgs, diff_a = _get_scenes(scan_path, seg_start)
-    # For the restored video the window is offset by fallback_offset
-    restored_start = seg_start + fallback_offset
-    scenes_b_idx_local, scenes_b_imgs, diff_b = _get_scenes(restored_path, max(0, restored_start))
-
-    # scenes_b_idx_local are frame numbers relative to restored video start;
-    # convert back to scan-relative by subtracting fallback_offset so offsets
-    # are in scan-frame space.
-    scenes_b_idx = scenes_b_idx_local  # absolute restored frame numbers
-
-    feat_params = dict(**scene_params, features=sc.get("features", "cnn"))
-
     def _get_features(video_path, frame_indices):
+        feat_params = dict(**scene_params, features=sc.get("features", "cnn"))
         cache_file = _cache_path(cache_dir, video_path, "feats_seg",
                                  **{**feat_params, "vp": video_path, "frames": str(frame_indices[:3].tolist())})
         if use_cache:
@@ -162,50 +172,78 @@ def estimate_segment_offset(
         _save_cache(cache_file, result)
         return result
 
-    if len(scenes_a_idx) == 0 or len(scenes_b_idx) == 0:
-        print(f"    No scene cuts found in segment — keeping offset {fallback_offset:+d}")
-        return fallback_offset
+    # --- Detect scenes in scan ---
+    scenes_scan_idx, scenes_scan_imgs, diff_scan = _get_scenes(scan_path, seg_start)
+    scan_name = Path(scan_path).stem
 
-    sigA = _get_features(scan_path, scenes_a_idx)
-    sigB = _get_features(restored_path, scenes_b_idx)
+    if len(scenes_scan_idx) == 0:
+        print(f"    No scene cuts in scan — keeping offsets r1={fallback_offset_r1:+d}, r2={fallback_offset_r2:+d}")
+        return fallback_offset_r1, fallback_offset_r2
 
-    offset, confidence, matches, sim = match_scenes_and_compute_offset(
-        scenes_a_idx, sigA, scenes_b_idx, sigB,
-        similarity_threshold=sim_thr,
-        consensus_tolerance=tol,
-    )
+    sigA = _get_features(scan_path, scenes_scan_idx)
 
-    # --- Save debug visualizations into segment's debug/ folder ---
-    if debug_dir is not None:
-        scan_name     = Path(scan_path).stem
+    # --- Match against both restored copies ---
+    offsets = {}  # label -> offset
+    debug_data = []  # for visualizations
+
+    for restored_path, label, fallback in [(r1_path, "r1", fallback_offset_r1), (r2_path, "r2", fallback_offset_r2)]:
         restored_name = Path(restored_path).stem
-        try:
-            visualize_scene_changes(
-                scenes_a_idx, scenes_a_imgs,
-                scenes_b_idx, scenes_b_imgs,
-                scan_name, restored_name,
-                diff_a, diff_b,
-                output_path=os.path.join(debug_dir, "scene_changes.png"),
-            )
-            visualize_similarity_matrix(
-                sim, scenes_a_idx, scenes_b_idx, matches,
-                output_path=os.path.join(debug_dir, "similarity_matrix.png"),
-            )
-            visualize_matched_scenes(
-                matches, scenes_a_idx, scenes_a_imgs,
-                scenes_b_idx, scenes_b_imgs,
-                scan_name, restored_name,
-                output_path=os.path.join(debug_dir, "matched_scenes.png"),
-            )
-        except Exception as e:
-            print(f"    [warn] debug visualization failed: {e}")
+        restored_start = seg_start + fallback
+        scenes_r_idx, scenes_r_imgs, diff_r = _get_scenes(restored_path, max(0, restored_start))
 
-    if not matches:
-        print(f"    No matches — keeping offset {fallback_offset:+d}")
-        return fallback_offset
+        if len(scenes_r_idx) == 0:
+            print(f"    [{label}] No scene cuts found — keeping offset {fallback:+d}")
+            offsets[label] = fallback
+            debug_data.append((fallback, 0.0, [], label, scenes_r_idx, scenes_r_imgs, diff_r, None, restored_name))
+            continue
 
-    print(f"    Segment offset={offset:+d}  confidence={confidence:.3f}  ({len(matches)} matches)")
-    return offset
+        sigB = _get_features(restored_path, scenes_r_idx)
+
+        offset, confidence, matches, sim = match_scenes_and_compute_offset(
+            scenes_scan_idx, sigA, scenes_r_idx, sigB,
+            similarity_threshold=sim_thr,
+            consensus_tolerance=tol,
+        )
+
+        if matches:
+            offsets[label] = offset
+            print(f"    [{label}] offset={offset:+d}  confidence={confidence:.3f}  ({len(matches)} matches)")
+        else:
+            offsets[label] = fallback
+            print(f"    [{label}] No matches — keeping offset {fallback:+d}")
+
+        debug_data.append((offset if matches else fallback, confidence, matches, label, scenes_r_idx, scenes_r_imgs, diff_r, sim, restored_name))
+
+    # --- Save debug visualizations for BOTH restored copies ---
+    if debug_dir is not None:
+        for offset, confidence, matches, label, scenes_r_idx, scenes_r_imgs, diff_r, sim, restored_name in debug_data:
+            try:
+                visualize_scene_changes(
+                    scenes_scan_idx, scenes_scan_imgs,
+                    scenes_r_idx, scenes_r_imgs,
+                    scan_name, restored_name,
+                    diff_scan, diff_r,
+                    output_path=os.path.join(debug_dir, f"scene_changes_{label}.png"),
+                )
+                if sim is not None:
+                    visualize_similarity_matrix(
+                        sim, scenes_scan_idx, scenes_r_idx, matches,
+                        output_path=os.path.join(debug_dir, f"similarity_matrix_{label}.png"),
+                    )
+                    visualize_matched_scenes(
+                        matches, scenes_scan_idx, scenes_scan_imgs,
+                        scenes_r_idx, scenes_r_imgs,
+                        scan_name, restored_name,
+                        output_path=os.path.join(debug_dir, f"matched_scenes_{label}.png"),
+                    )
+            except Exception as e:
+                print(f"    [warn] debug visualization for {label} failed: {e}")
+
+    # Warn if offsets differ
+    if offsets["r1"] != offsets["r2"]:
+        print(f"    [info] Different offsets: r1={offsets['r1']:+d}, r2={offsets['r2']:+d}")
+
+    return offsets["r1"], offsets["r2"]
 
 
 def _detect_scene_changes_windowed(
@@ -335,7 +373,8 @@ def _frame_task(kwargs: dict) -> bool:
 
 def process_frame(
     frame_num: int,
-    offset: int,
+    offset_r1: int,
+    offset_r2: int,
     scan_path: str,
     r1_path: str,
     r2_path: str,
@@ -352,16 +391,19 @@ def process_frame(
     tag          = f"{frame_num:06d}.png"
     failures_dir = os.path.join(seg_dir, "debug", "alignment_failures")
 
-    # --- Extract frames ---
+    # --- Extract frames (using separate offsets for each restored copy) ---
     scan_raw = extract_frame(scan_path, frame_num, 0)
-    r1_raw   = extract_frame(r1_path,   frame_num, offset)
-    r2_raw   = extract_frame(r2_path,   frame_num, offset)
+    r1_raw   = extract_frame(r1_path,   frame_num, offset_r1)
+    r2_raw   = extract_frame(r2_path,   frame_num, offset_r2)
 
     if scan_raw is None:
         print(f"    [skip] scan frame {frame_num} unavailable")
         return False
-    if r1_raw is None or r2_raw is None:
-        print(f"    [skip] frame {frame_num}: restored frame unavailable at offset {offset:+d}")
+    if r1_raw is None:
+        print(f"    [skip] frame {frame_num}: r1 unavailable at offset {offset_r1:+d}")
+        return False
+    if r2_raw is None:
+        print(f"    [skip] frame {frame_num}: r2 unavailable at offset {offset_r2:+d}")
         return False
 
     # --- Convert to float32 [0,1] ---
@@ -536,8 +578,31 @@ def run(cfg: dict, cli_overrides: dict):
     print(f"  Workers:         {workers}  ({threads_per_worker} threads/worker)")
     print("=" * 60 + "\n")
 
-    # Carry forward the offset between segments
-    current_offset = 0
+    # --- Initialize wandb ---
+    wandb_cfg = cfg.get("wandb", {})
+    wandb_enabled = wandb_cfg.get("enabled", True)
+    if wandb_enabled:
+        wandb.init(
+            project=wandb_cfg.get("project", "film-restoration-pipeline"),
+            name=wandb_cfg.get("run_name", f"{Path(scan_path).stem}"),
+            config={
+                "scan": scan_path,
+                "restored_1": r1_path,
+                "restored_2": r2_path,
+                "total_segments": len(segments),
+                "segment_frames": segment_frames,
+                "stride": stride,
+                "total_frames_est": total_frames_est,
+                "workers": workers,
+                "mask_threshold": mask_threshold,
+            },
+        )
+        print("wandb initialized\n")
+
+    # Carry forward the offsets between segments (separate for each restored copy)
+    offset_r1 = 0
+    offset_r2 = 0
+    pipeline_start_time = time.time()
 
     # Create the executor ONCE — workers are reused across all segments.
     # This avoids spawning a fresh pool per segment and leaving zombies behind.
@@ -547,32 +612,39 @@ def run(cfg: dict, cli_overrides: dict):
         initargs=(save_inpainted, threads_per_worker),
     )
 
+    total_frames_processed = 0
     try:
         for seg_idx, (seg_start, seg_end) in enumerate(segments):
+            segment_start_time = time.time()
+
             print("=" * 60)
             print(f"Segment {seg_idx + 1}/{len(segments)}  "
-                  f"frames {seg_start}–{seg_end}  (offset so far: {current_offset:+d})")
+                  f"frames {seg_start}–{seg_end}  (offsets: r1={offset_r1:+d}, r2={offset_r2:+d})")
             print("=" * 60)
 
             # --- 1. Temporal offset for this segment ---
             print("  Step 1: scene matching for temporal offset...")
+            scene_match_start = time.time()
             seg_dir = _segment_dir(out_dir, seg_start, seg_end, cfg)
-            current_offset = estimate_segment_offset(
-                scan_path, r1_path,
+            offset_r1, offset_r2 = estimate_segment_offset(
+                scan_path, r1_path, r2_path,
                 seg_start, seg_end,
                 cfg, extractor,
-                fallback_offset=current_offset,
+                fallback_offset_r1=offset_r1,
+                fallback_offset_r2=offset_r2,
                 debug_dir=os.path.join(seg_dir, "debug"),
             )
+            scene_match_time = time.time() - scene_match_start
 
             # --- 2. Frame-level processing (parallel) ---
             frame_nums = list(range(seg_start, seg_end, stride))
             print(f"  Step 2: processing {len(frame_nums)} frames "
-                  f"(every {stride} frames, offset={current_offset:+d}, workers={workers})...")
+                  f"(every {stride} frames, offsets: r1={offset_r1:+d}, r2={offset_r2:+d}, workers={workers})...")
 
             tasks = [dict(
                 frame_num=fn,
-                offset=current_offset,
+                offset_r1=offset_r1,
+                offset_r2=offset_r2,
                 scan_path=scan_path,
                 r1_path=r1_path,
                 r2_path=r2_path,
@@ -585,6 +657,7 @@ def run(cfg: dict, cli_overrides: dict):
                 inpaint_dilation=inpaint_dilation,
             ) for fn in frame_nums]
 
+            frame_proc_start = time.time()
             saved = 0
             futures = {executor.submit(_frame_task, t): t["frame_num"] for t in tasks}
             with tqdm(total=len(futures), desc=f"  seg {seg_start}-{seg_end}") as pbar:
@@ -596,8 +669,60 @@ def run(cfg: dict, cli_overrides: dict):
                         fn = futures[fut]
                         print(f"\n    [error] frame {fn}: {e}")
                     pbar.update(1)
+            frame_proc_time = time.time() - frame_proc_start
 
-            print(f"  Saved {saved}/{len(frame_nums)} frames → {seg_dir}\n")
+            segment_time = time.time() - segment_start_time
+            total_elapsed = time.time() - pipeline_start_time
+            total_frames_processed += len(frame_nums)
+
+            # Calculate ETA
+            segments_done = seg_idx + 1
+            segments_remaining = len(segments) - segments_done
+            avg_segment_time = total_elapsed / segments_done
+            eta_seconds = avg_segment_time * segments_remaining
+
+            # Progress percentage
+            progress_pct = (segments_done / len(segments)) * 100
+            frames_progress_pct = (total_frames_processed / total_frames_est) * 100
+
+            print(f"  Saved {saved}/{len(frame_nums)} frames → {seg_dir}")
+            print(f"  Timing: scene_match={scene_match_time:.1f}s  frames={frame_proc_time:.1f}s  total={segment_time:.1f}s")
+            print(f"  Progress: {segments_done}/{len(segments)} segments ({progress_pct:.1f}%)  ETA: {_format_time(eta_seconds)}\n")
+
+            # Log to wandb
+            if wandb_enabled:
+                wandb.log({
+                    # Segment timing
+                    "segment/scene_match_time_s": scene_match_time,
+                    "segment/frame_processing_time_s": frame_proc_time,
+                    "segment/total_time_s": segment_time,
+                    "segment/frames_saved": saved,
+                    "segment/frames_total": len(frame_nums),
+                    "segment/save_rate": saved / len(frame_nums) if frame_nums else 0,
+                    "segment/avg_time_per_frame_s": frame_proc_time / len(frame_nums) if frame_nums else 0,
+
+                    # Overall progress
+                    "progress/segments_completed": segments_done,
+                    "progress/segments_total": len(segments),
+                    "progress/segment_pct": progress_pct,
+                    "progress/frames_processed": total_frames_processed,
+                    "progress/frames_total_est": total_frames_est,
+                    "progress/frames_pct": frames_progress_pct,
+
+                    # Time estimates
+                    "time/elapsed_s": total_elapsed,
+                    "time/elapsed_min": total_elapsed / 60,
+                    "time/eta_s": eta_seconds,
+                    "time/eta_min": eta_seconds / 60,
+                    "time/avg_segment_time_s": avg_segment_time,
+
+                    # Current segment info
+                    "current/segment_idx": seg_idx,
+                    "current/segment_start_frame": seg_start,
+                    "current/segment_end_frame": seg_end,
+                    "current/offset_r1": offset_r1,
+                    "current/offset_r2": offset_r2,
+                })
 
     except KeyboardInterrupt:
         print("\n\nInterrupted — shutting down workers...")
@@ -610,7 +735,17 @@ def run(cfg: dict, cli_overrides: dict):
             child.terminate()
         print("Workers stopped.")
 
-    print("Pipeline complete.")
+        # Finalize wandb
+        if wandb_enabled:
+            total_time = time.time() - pipeline_start_time
+            wandb.log({
+                "summary/total_time_s": total_time,
+                "summary/total_time_min": total_time / 60,
+                "summary/total_frames_processed": total_frames_processed,
+            })
+            wandb.finish()
+
+    print(f"Pipeline complete. Total time: {_format_time(time.time() - pipeline_start_time)}")
 
 
 # ---------------------------------------------------------------------------
